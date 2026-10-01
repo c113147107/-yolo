@@ -1,0 +1,125 @@
+import cv2
+import time
+import numpy as np
+from ultralytics import YOLO
+
+model = YOLO('yolov8n-pose.pt')
+
+cap = cv2.VideoCapture(0)
+
+ref_ankle_knee_dist = 0.0  # 校正出的「腳踝-膝蓋」基準距離
+lift_threshold = 0.0  # 動態計算出的抬腳判定閾值
+
+start_time = 0
+current_score = 0.0
+last_final_score = 0.0
+countdown_start_time = 0
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    current_time = time.time()
+
+    results = model.predict(source=frame, show=False, conf=0.5, verbose=False)
+
+    key = cv2.waitKey(1) & 0xFF
+
+    if results[0].keypoints is not None and len(results[0].keypoints.xy) > 0:
+        keypoints = results[0].keypoints.xy[0].cpu().numpy()
+
+        if len(keypoints) >= 17:
+            left_knee = keypoints[13]
+            right_knee = keypoints[14]
+            left_ankle = keypoints[15]
+            right_ankle = keypoints[16]
+
+            has_legs = (left_knee[1] > 0 and right_knee[1] > 0 and
+                        left_ankle[1] > 0 and right_ankle[1] > 0)
+
+            if key == 32:  # 32 為空白鍵 (Space)
+                if has_legs:
+                    left_dist = abs(left_ankle[1] - left_knee[1])
+                    right_dist = abs(right_ankle[1] - right_knee[1])
+                    ref_ankle_knee_dist = (left_dist + right_dist) / 2.0
+
+                    lift_threshold = ref_ankle_knee_dist * 0.4
+
+                    state = 0
+                    countdown_start_time = current_time
+                    print(f"✅ 校正成功！膝腳基準距離：{ref_ankle_knee_dist:.1f}px，抬腳門檻：{lift_threshold:.1f}px")
+                else:
+                    print("⚠️ 未清晰偵測到雙腿，請站直並確保雙腳均在畫面中！")
+
+            if has_legs and state != -1:
+                ankle_diff = abs(left_ankle[1] - right_ankle[1])
+                is_foot_lifted = ankle_diff > lift_threshold
+
+                if state == 0:
+                    elapsed_cd = current_time - countdown_start_time
+                    if elapsed_cd >= 2.0:
+                        state = 1  # 倒數結束，進入等待抬腳狀態
+
+                elif state == 1 or state == 3:
+                    if is_foot_lifted:
+                        state = 2  # 偵測到抬腳，直接自動開始計時！
+                        start_time = current_time
+
+                elif state == 2:
+                    if not is_foot_lifted:
+                        # 腳落地 -> 結束測試
+                        last_final_score = current_time - start_time
+                        state = 3  # 進入完成狀態 (保留成績，隨時可再抬腳測試)
+                    else:
+                        current_score = current_time - start_time
+
+        frame = results[0].plot()
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (10, 10), (620, 140), (0, 0, 0), -1)
+    frame = cv2.addWeighted(overlay, 0.4, frame, 0.6, 0)
+
+    if state == -1:
+        cv2.putText(frame, "STATUS: Stand Straight & Press [SPACE]", (30, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (0, 255, 255), 2)
+        cv2.putText(frame, "Align your body, then press SPACE to calibrate.", (30, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (255, 255, 255), 1)
+        cv2.putText(frame, "Calib Dist: Not set", (30, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
+
+    elif state == 0:
+        cd_remaining = max(0.0, 2.0 - (current_time - countdown_start_time))
+        cv2.putText(frame, f"STATUS: Get Ready! ({cd_remaining:.1f}s)", (30, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    (0, 165, 255), 2)
+        cv2.putText(frame, "Preparing for balance test...", (30, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(frame, "Time: 0.00 s", (30, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    elif state == 1:
+        cv2.putText(frame, "STATUS: Ready! LIFT any foot to START", (30, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    (0, 255, 0), 2)
+        cv2.putText(frame, "Lift Left or Right foot to trigger timer...", (30, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (255, 255, 255), 1)
+        cv2.putText(frame, "Time: 0.00 s", (30, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    elif state == 2:
+        cv2.putText(frame, "STATUS: Timing... (Hands Free)", (30, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(frame, "Keep balance! Put foot down to stop.", (30, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (200, 200, 200), 1)
+        cv2.putText(frame, f"Time: {current_score:.2f} s", (30, 125), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+
+    elif state == 3:
+        cv2.putText(frame, "STATUS: FINISHED (Lift foot again for next)", (30, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (0, 200, 255), 2)
+        cv2.putText(frame, "Lift foot again to START | [SPACE] Re-calibrate | [Q] Exit", (30, 85),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, f"Last Score: {last_final_score:.2f} s", (30, 125), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                    (0, 255, 255), 3)
+
+    cv2.imshow("SLS Auto Calibration & Balance Timer", frame)
+
+    if key == ord('q') or key == ord('Q') or key == 27:
+        print("👋 系統關閉。")
+        break
+
+cap.release()
+cv2.destroyAllWindows()
